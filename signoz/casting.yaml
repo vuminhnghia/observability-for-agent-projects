@@ -1,0 +1,83 @@
+apiVersion: v1alpha1
+kind: Installation
+metadata:
+  name: signoz
+spec:
+  deployment:
+    mode: docker
+    flavor: compose
+
+  signoz:
+    spec:
+      env:
+        SIGNOZ_TOKENIZER_JWT_SECRET: "${SIGNOZ_JWT_SECRET}"
+
+  # Cap cứng bên trong ClickHouse. Các số này phải nhỏ hơn mem_limit của container
+  # bên dưới, để ClickHouse tự từ chối query thay vì bị kernel OOM-kill.
+  telemetrystore:
+    spec:
+      config:
+        data:
+          config-0-0.yaml: |
+            max_server_memory_usage: 4294967296             # 4 GiB
+            max_server_memory_usage_to_ram_ratio: 1         # tắt phần co giãn theo RAM host
+            mark_cache_size: 536870912                      # 512 MiB (mặc định 5 GiB)
+            # user-level setting: phải nằm trong profiles, đặt ở top level ClickHouse sẽ crash
+            profiles:
+              default:
+                max_bytes_before_external_group_by: 1610612736   # 1.5 GiB thì spill xuống disk
+
+  # mem_limit/cpus la field cua Docker Compose, Foundry khong model -> phai di qua patches.
+  # memswap_limit = mem_limit la cach tat swap cho container.
+  patches:
+    - target: "deployment/compose.yaml"
+      operations:
+        - op: add
+          path: /services/signoz-telemetrystore-clickhouse-0-0/mem_limit
+          value: "6g"
+        - op: add
+          path: /services/signoz-telemetrystore-clickhouse-0-0/memswap_limit
+          value: "6g"
+        - op: add
+          path: /services/signoz-telemetrystore-clickhouse-0-0/cpus
+          value: 4.0
+
+        - op: add
+          path: /services/signoz-signoz-0/mem_limit
+          value: "2g"
+        - op: add
+          path: /services/signoz-signoz-0/memswap_limit
+          value: "2g"
+        - op: add
+          path: /services/signoz-signoz-0/cpus
+          value: 2.0
+
+        - op: add
+          path: /services/ingester/mem_limit
+          value: "1g"
+        - op: add
+          path: /services/ingester/memswap_limit
+          value: "1g"
+        - op: add
+          path: /services/ingester/cpus
+          value: 2.0
+
+        - op: add
+          path: /services/signoz-metastore-postgres-0/mem_limit
+          value: "1g"
+        - op: add
+          path: /services/signoz-metastore-postgres-0/memswap_limit
+          value: "1g"
+        - op: add
+          path: /services/signoz-metastore-postgres-0/cpus
+          value: 1.0
+
+        - op: add
+          path: /services/signoz-telemetrykeeper-clickhousekeeper-0/mem_limit
+          value: "1g"
+        - op: add
+          path: /services/signoz-telemetrykeeper-clickhousekeeper-0/memswap_limit
+          value: "1g"
+        - op: add
+          path: /services/signoz-telemetrykeeper-clickhousekeeper-0/cpus
+          value: 1.0

@@ -1,0 +1,9 @@
+# Clone repo ngoài — có git riêng, không track ở đây
+opik/
+
+# Source Foundry tải về chỉ để đọc docs offline, và binary từ GitHub release
+signoz/foundry/
+signoz/bin/
+
+# File sinh tự động bởi foundryctl, bị ghi đè mỗi lần forge
+signoz/pours/
