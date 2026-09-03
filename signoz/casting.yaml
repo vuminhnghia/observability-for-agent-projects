@@ -22,6 +22,30 @@ spec:
             max_server_memory_usage: 4294967296             # 4 GiB
             max_server_memory_usage_to_ram_ratio: 1         # tắt phần co giãn theo RAM host
             mark_cache_size: 536870912                      # 512 MiB (mặc định 5 GiB)
+
+            # metric_log 1552 cột: merge Horizontal trên part Wide mở 1552 luồng ghi cột
+            # -> ~3.7GiB/merge, vượt cap 4GiB, fail vô hạn. Giữ part ở dạng Compact (mọi cột
+            # trong 1 file) thì Horizontal rẻ: đo được 122MiB thay vì 3.58GiB.
+            # KHÔNG dùng vertical merge: TTLDropMerge/TTLDeleteMerge luôn bị ép Horizontal ở
+            # 25.12.5.44 (setting vertical_merge_optimize_ttl_delete chưa có), nên ép vertical
+            # chỉ cứu merge thường còn TTL vẫn fail -> deadlock quay lại sau ~1 ngày.
+            # Đánh đổi: part Compact phải giải nén khối chung khi đọc một cột -> query soi
+            # metric_log chậm hơn dạng Wide. Bảng tự-giám-sát này không ai query nên chấp nhận.
+            # 10GiB/100M không phải con số tinh chỉnh, nó chỉ cần cao hơn mọi kích cỡ mà TTL
+            # 1 ngày có thể tạo ra (~242MB/ngày) — tức là "không bao giờ Wide".
+            # Exit path nếu TTLDropMerge vẫn fail: metric_log.schema_type = transposed (1552 cột
+            # -> 6 cột, đã test chạy được trên 25.12.5.44) — đổi cấu trúc bảng nên làm riêng.
+            # Phải khai qua 'engine' vì SETTINGS chỉ đặt được ở đó; 'ttl' rời gỡ ở patch cuối.
+            metric_log:
+              engine: |
+                ENGINE = MergeTree
+                PARTITION BY toYYYYMM(event_date)
+                ORDER BY (event_date, event_time)
+                TTL event_date + INTERVAL 1 DAY DELETE
+                SETTINGS min_bytes_for_wide_part = 10737418240,
+                         min_rows_for_wide_part = 100000000,
+                         vertical_merge_algorithm_min_rows_to_activate = 1000
+
             # user-level setting: phải nằm trong profiles, đặt ở top level ClickHouse sẽ crash
             profiles:
               default:
@@ -81,3 +105,31 @@ spec:
         - op: add
           path: /services/signoz-telemetrykeeper-clickhousekeeper-0/cpus
           value: 1.0
+
+        # Docker json-file khong co rotation san -> mot loi lap la day o. Chan o 150MB/service.
+        - op: add
+          path: /services/signoz-telemetrystore-clickhouse-0-0/logging
+          value: &logging
+            driver: json-file
+            options:
+              max-size: "50m"
+              max-file: "3"
+        - op: add
+          path: /services/signoz-signoz-0/logging
+          value: *logging
+        - op: add
+          path: /services/ingester/logging
+          value: *logging
+        - op: add
+          path: /services/signoz-metastore-postgres-0/logging
+          value: *logging
+        - op: add
+          path: /services/signoz-telemetrykeeper-clickhousekeeper-0/logging
+          value: *logging
+
+    # Foundry deep-merge nen 'ttl' cu van con sau khi them 'engine'. ClickHouse khong nhan
+    # ca hai -> khong khoi dong duoc (exit 36). TTL da nam trong engine nen go key roi nay.
+    - target: "deployment/telemetrystore/clickhouse/config-0-0.yaml"
+      operations:
+        - op: remove
+          path: /metric_log/ttl

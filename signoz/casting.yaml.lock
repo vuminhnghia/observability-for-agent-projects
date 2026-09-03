@@ -377,7 +377,46 @@ spec:
     - op: add
       path: /services/signoz-telemetrykeeper-clickhousekeeper-0/cpus
       value: 1
+    - op: add
+      path: /services/signoz-telemetrystore-clickhouse-0-0/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 50m
+    - op: add
+      path: /services/signoz-signoz-0/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 50m
+    - op: add
+      path: /services/ingester/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 50m
+    - op: add
+      path: /services/signoz-metastore-postgres-0/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 50m
+    - op: add
+      path: /services/signoz-telemetrykeeper-clickhousekeeper-0/logging
+      value:
+        driver: json-file
+        options:
+          max-file: "3"
+          max-size: 50m
     target: deployment/compose.yaml
+  - operations:
+    - op: remove
+      path: /metric_log/ttl
+    target: deployment/telemetrystore/clickhouse/config-0-0.yaml
   signoz:
     spec:
       cluster:
@@ -506,6 +545,14 @@ spec:
             max_server_memory_usage: 4294967296
             max_server_memory_usage_to_ram_ratio: 1
             metric_log:
+              engine: |
+                ENGINE = MergeTree
+                PARTITION BY toYYYYMM(event_date)
+                ORDER BY (event_date, event_time)
+                TTL event_date + INTERVAL 1 DAY DELETE
+                SETTINGS min_bytes_for_wide_part = 10737418240,
+                         min_rows_for_wide_part = 100000000,
+                         vertical_merge_algorithm_min_rows_to_activate = 1000
               flush_interval_milliseconds: 30000
               ttl: event_date + INTERVAL 1 DAY DELETE
             part_log:
