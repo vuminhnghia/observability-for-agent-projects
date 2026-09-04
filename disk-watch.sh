@@ -26,7 +26,7 @@ if [ "${1:-}" = "--status" ]; then
   [ -f "$LOG" ] || { echo "chua co du lieu — chay ./disk-watch.sh mot lan"; exit 0; }
   echo "── 10 lan do gan nhat ──"
   tail -10 "$LOG"
-  n=$(grep -c ALERT "$LOG" 2>/dev/null || echo 0)
+  n=$(grep -c ALERT "$LOG" 2>/dev/null) || n=0   # grep -c da in 0 khi khong khop
   echo
   if [ "$n" -gt 0 ]; then
     echo "── $n dong ALERT, gan nhat ──"; grep ALERT "$LOG" | tail -3
