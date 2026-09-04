@@ -7,3 +7,7 @@ signoz/bin/
 
 # File sinh tự động bởi foundryctl, bị ghi đè mỗi lần forge
 signoz/pours/
+
+# Sinh boi disk-watch.sh
+disk-watch.log
+.disk-watch/
