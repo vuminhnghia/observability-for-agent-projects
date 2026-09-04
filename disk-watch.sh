@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# Canh disk, ghi ra disk-watch.log ngay canh file nay.
+# Disk watchdog. Appends one line per run to disk-watch.log next to this script.
 #
-# Vi sao ton tai: su co metric_log 09/2026 chay 30 ngay hoan toan im lang, den khi
-# o day 100% moi biet. Cai nay bat ca hai kieu chet — cham (nguong %) va nhanh
-# (nguong so ngay con lai) — nen khong phu thuoc vao viec doan truoc bug la gi.
+# Why it exists: a ClickHouse merge loop filled this host's disk over 30 days without a
+# single warning - the first symptom was the disk hitting 100%. This catches both shapes
+# of that failure: the slow one (a percentage threshold) and the fast one (a projection of
+# days remaining), so it does not depend on guessing what the next bug will be.
 #
-# Doc log:  ./disk-watch.sh --status
-# Chay tay: ./disk-watch.sh
-# Cron:     0 * * * * /home/nghiavm/workdir/observability/disk-watch.sh
+# It is deliberately independent of Docker, ClickHouse and SigNoz. The incident was the
+# monitoring stack filling its own disk; an alert living inside that stack would have died
+# with it.
+#
+#   ./disk-watch.sh --status    read the log and the current state
+#   ./disk-watch.sh             take one measurement (this is what cron runs)
+#   0 * * * * /path/to/disk-watch.sh
 set -uo pipefail
 
 MOUNT="${MOUNT:-/}"
-PCT_WARN="${PCT_WARN:-75}"        # keu khi dung >= X%
-DAYS_WARN="${DAYS_WARN:-30}"      # keu khi du bao day o trong < X ngay
-KEEP_LINES="${KEEP_LINES:-2000}"  # ~3 thang chay moi gio; tu no khong duoc phinh
+PCT_WARN="${PCT_WARN:-75}"        # alert at or above this percentage used
+DAYS_WARN="${DAYS_WARN:-30}"      # alert when the disk is projected to fill within this
+KEEP_LINES="${KEEP_LINES:-2000}"  # roughly 3 months of hourly runs; keeps this from growing
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$HERE/disk-watch.log"
@@ -21,24 +26,25 @@ STATE="$HERE/.disk-watch"
 SAMPLES="$STATE/samples"
 mkdir -p "$STATE"
 
-# ─── Che do doc ──────────────────────────────────────────────────────────────
+# ── Read mode ─────────────────────────────────────────────────────────────────────────
 if [ "${1:-}" = "--status" ]; then
-  [ -f "$LOG" ] || { echo "chua co du lieu — chay ./disk-watch.sh mot lan"; exit 0; }
-  echo "── 10 lan do gan nhat ──"
+  [ -f "$LOG" ] || { echo "no data yet - run ./disk-watch.sh once"; exit 0; }
+  echo "── last 10 measurements ──"
   tail -10 "$LOG"
-  n=$(grep -c ALERT "$LOG" 2>/dev/null) || n=0   # grep -c da in 0 khi khong khop
+  n=$(grep -c ALERT "$LOG" 2>/dev/null) || n=0   # grep -c already prints 0 when it finds none
   echo
   if [ "$n" -gt 0 ]; then
-    echo "── $n dong ALERT, gan nhat ──"; grep ALERT "$LOG" | tail -3
+    echo "── $n ALERT lines, most recent ──"; grep ALERT "$LOG" | tail -3
   else
-    echo "chua co ALERT nao."
+    echo "no ALERT lines so far."
   fi
-  last=$(stat -c %Y "$LOG"); age=$(( ($(date +%s) - last) / 60 ))
-  [ "$age" -gt 90 ] && echo "!! lan ghi cuoi $age phut truoc — cron co the da chet"
+  # Staleness of the last line is the proof of life for cron itself, so no heartbeat is needed.
+  age=$(( ($(date +%s) - $(stat -c %Y "$LOG")) / 60 ))
+  [ "$age" -gt 90 ] && echo "!! last write was $age minutes ago - cron may have stopped"
   exit 0
 fi
 
-# ─── Do ──────────────────────────────────────────────────────────────────────
+# ── Measure ───────────────────────────────────────────────────────────────────────────
 read -r TOTAL USED AVAIL < <(df -B1 --output=size,used,avail "$MOUNT" | tail -1)
 PCT=$(( USED * 100 / TOTAL ))
 NOW=$(date +%s)
@@ -46,7 +52,8 @@ NOW=$(date +%s)
 echo "$NOW $USED" >> "$SAMPLES"
 awk -v c=$((NOW - 8*86400)) '$1 >= c' "$SAMPLES" > "$SAMPLES.t" && mv "$SAMPLES.t" "$SAMPLES"
 
-# toc do tinh tu mau cu nhat con lai; can >= 1 gio de do nhieu
+# Rate is measured against the oldest sample still in the 8-day window. At least an hour of
+# history is required, otherwise short-term noise dominates and the projection is useless.
 read -r RATE DAYS < <(awk -v now="$NOW" -v used="$USED" -v avail="$AVAIL" '
   NR==1 { t0=$1; u0=$2 }
   END {
@@ -57,14 +64,14 @@ read -r RATE DAYS < <(awk -v now="$NOW" -v used="$USED" -v avail="$AVAIL" '
     else           printf "%.2f %.0f\n", r, avail/1073741824/r
   }' "$SAMPLES")
 
-# ─── Quyet dinh ──────────────────────────────────────────────────────────────
+# ── Decide ────────────────────────────────────────────────────────────────────────────
 STATUS="OK"; WHY=""
 if [ "$PCT" -ge "$PCT_WARN" ]; then
-  STATUS="ALERT"; WHY="dung ${PCT}% >= ${PCT_WARN}%"
+  STATUS="ALERT"; WHY="${PCT}% used, at or above ${PCT_WARN}%"
 fi
 if [ "$DAYS" != "na" ] && [ "$DAYS" -lt "$DAYS_WARN" ]; then
   STATUS="ALERT"
-  WHY="${WHY:+$WHY; }day o trong ~${DAYS} ngay (< ${DAYS_WARN})"
+  WHY="${WHY:+$WHY; }projected full in ~${DAYS} days (under ${DAYS_WARN})"
 fi
 
 LINE=$(printf '%s  %3d%%  %6.1f/%.1fGB  free %6.1fGB  %8s  %6s  %s%s' \
@@ -74,21 +81,22 @@ LINE=$(printf '%s  %3d%%  %6.1f/%.1fGB  free %6.1fGB  %8s  %6s  %s%s' \
   "$(awk -v x="$AVAIL" 'BEGIN{print x/1073741824}')" \
   "$([ "$RATE" = na ] && echo '-' || printf '%+.2fGB/d' "$RATE")" \
   "$([ "$DAYS" = na ] && echo '-' || echo "~${DAYS}d")" \
-  "$STATUS" "${WHY:+ — $WHY}")
+  "$STATUS" "${WHY:+ - $WHY}")
 
 echo "$LINE" >> "$LOG"
 
-# ALERT thi ghi them goi y dieu tra, va in ra stdout (cron se mail neu co MTA)
+# On alert, record where to look next, so whoever reads this months from now does not have
+# to rediscover it. Also print to stdout, which cron mails if an MTA is configured.
 if [ "$STATUS" = ALERT ]; then
   {
-    echo "    nghi truoc tien — log container khong rotation, va database system cua ClickHouse:"
+    echo "    look first at container logs without rotation, and at ClickHouse system databases:"
     echo "      for c in \$(docker ps --format '{{.Names}}'); do echo \"\$(docker logs \$c 2>&1|wc -c) \$c\"; done | sort -rn | head"
     echo "      docker system df"
   } >> "$LOG"
   echo "$LINE"
 fi
 
-# tu gioi han kich thuoc — khong de chinh no thanh nguon day o
+# Keep this from becoming a source of the very problem it watches for.
 if [ "$(wc -l < "$LOG")" -gt "$KEEP_LINES" ]; then
   tail -n "$KEEP_LINES" "$LOG" > "$LOG.t" && mv "$LOG.t" "$LOG"
 fi

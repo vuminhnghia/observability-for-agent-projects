@@ -1,0 +1,17 @@
+<clickhouse>
+    <!-- Disable the query profiler.
+
+         This is a USER-level setting, so it must live in users.d/. Placing it in
+         config.d/ is silently ignored - verified by boot test: the server started fine
+         and the setting stayed at its default.
+
+         Why: 172.26 million of 172.67 million trace_log samples had an empty query_id,
+         meaning 99.8% of the sampling was of idle background threads rather than anyone's
+         query. That alone accounted for 4.81 GiB of the system database. -->
+    <profiles>
+        <default>
+            <query_profiler_real_time_period_ns>0</query_profiler_real_time_period_ns>
+            <query_profiler_cpu_time_period_ns>0</query_profiler_cpu_time_period_ns>
+        </default>
+    </profiles>
+</clickhouse>

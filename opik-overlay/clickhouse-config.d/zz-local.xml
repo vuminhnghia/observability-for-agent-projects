@@ -1,0 +1,55 @@
+<clickhouse>
+    <!-- Local overlay for Opik's ClickHouse. Not part of upstream comet-ml/opik.
+
+         Why this exists: the `system` database grew to 12.15 GiB / 1.48 billion rows in
+         35 days, while the `opik` database (the actual traces) held only 55.80 MiB - a
+         ratio of 223:1. Root cause was a 1-second healthcheck generating 173k error log
+         lines per day, combined with Trace/Debug log level and no TTL on 9 of 13 system
+         tables. See the repository README for the full incident write-up.
+
+         Installed into the `opik-opik_clickhouse-config` Docker volume, so it survives
+         both `git pull` in the upstream clone and container recreation (Opik's
+         clickhouse-init only copies files in, it never removes unknown ones).
+
+         NOTE when editing: XML comments must not contain two consecutive hyphens. -->
+
+    <!-- 1. metric_log: force Compact parts BEFORE attaching a TTL.
+
+         This table has 1552 columns. TTLDropMerge and TTLDeleteMerge are ALWAYS forced
+         to the Horizontal algorithm (the `vertical_merge_optimize_ttl_delete` setting
+         that would allow otherwise does not exist in 26.3), and a Horizontal merge over
+         Wide parts must open one write buffer per column - roughly 3.6 GiB per merge.
+         Attaching a TTL without these two settings recreates exactly the merge deadlock
+         that filled 259 GB of disk on the SigNoz stack.
+
+         Compact parts keep all 1552 columns in a single file, so Horizontal stays cheap:
+         measured 122 MiB instead of 3.58 GiB. The thresholds only need to exceed
+         anything a 14-day TTL can accumulate, i.e. effectively "never Wide".
+
+         Trade-off: reading a single column from a Compact part decompresses the shared
+         block, so column-selective queries on metric_log are slower. Nothing queries
+         this table, so that cost is not paid in practice.
+
+         Declared via <engine> because SETTINGS can only be given inside it; the TTL must
+         therefore live in the engine string too. Do not also add a separate <ttl> tag -
+         ClickHouse refuses to start when both are present. -->
+    <metric_log>
+        <engine>ENGINE = MergeTree
+                PARTITION BY toYYYYMM(event_date)
+                ORDER BY (event_date, event_time)
+                TTL event_date + INTERVAL 14 DAY DELETE
+                SETTINGS min_bytes_for_wide_part = 10737418240,
+                         min_rows_for_wide_part = 100000000</engine>
+    </metric_log>
+
+    <!-- 2. A 14-day TTL for the remaining system log tables. These are all narrow (33
+         columns at most), so their Horizontal TTL merges are already cheap - measured
+         on this host at 15 to 265 MiB with zero failures. -->
+    <trace_log>               <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </trace_log>
+    <text_log>                <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </text_log>
+    <part_log>                <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </part_log>
+    <query_log>               <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </query_log>
+    <error_log>               <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </error_log>
+    <asynchronous_metric_log> <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </asynchronous_metric_log>
+    <query_metric_log>        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </query_metric_log>
+</clickhouse>
