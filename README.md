@@ -72,7 +72,8 @@ ingestion.
 ### 2. Opik
 
 Upstream is cloned separately, because self-hosting Opik officially means cloning their
-repo and running their script:
+repo and running their script. Clone it shallow and sparse - a full clone is 1.2 GB, this
+is 5.5 MB:
 
 ```bash
 cd /home/nghiavm/workdir/observability
@@ -81,10 +82,22 @@ cd opik
 git sparse-checkout set deployment scripts
 ```
 
-A full clone is 1.2 GB - 694 MB of git history across 26,597 commits and 8,283 tags, plus
-333 MB of documentation videos. The compose file pulls every image from
-`ghcr.io/comet-ml/opik/`, with no `build:` anywhere, so none of the application source is
-needed to run it. `deployment/` plus `opik.sh` is about 400 KB.
+To pin a specific upstream commit instead of taking the tip of `main`:
+
+```bash
+git init opik && cd opik
+git remote add origin https://github.com/comet-ml/opik.git
+git sparse-checkout init --cone
+git sparse-checkout set deployment scripts
+git fetch --depth 1 --filter=blob:none origin <commit-sha>
+git checkout -b main FETCH_HEAD
+```
+
+Why so much is skippable: 694 MB of that 1.2 GB is git history across 26,597 commits and
+8,283 tags, and 333 MB is documentation videos. The compose file pulls every image from
+`ghcr.io/comet-ml/opik/` with no `build:` anywhere, so none of the application source is
+needed to run the stack - `deployment/` plus `opik.sh` comes to about 400 KB. The clone
+stays a normal working clone: `git pull` still upgrades it.
 
 Apply this repository's changes, then start:
 
