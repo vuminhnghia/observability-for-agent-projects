@@ -3,36 +3,90 @@
 
          Why this exists: the `system` database grew to 12.15 GiB / 1.48 billion rows in
          35 days, while the `opik` database (the actual traces) held only 55.80 MiB - a
-         ratio of 223:1. Root cause was a 1-second healthcheck generating 173k error log
-         lines per day, combined with Trace/Debug log level and no TTL on 9 of 13 system
-         tables. See the repository README for the full incident write-up.
+         ratio of 223:1. See the repository README for the full incident write-up.
 
          Installed into the `opik-opik_clickhouse-config` Docker volume, so it survives
          both `git pull` in the upstream clone and container recreation (Opik's
          clickhouse-init only copies files in, it never removes unknown ones).
 
+         Removing a log table only takes effect on restart, and `remove="1"` is only
+         honoured from config.d - it is silently ignored in the main config.xml
+         (ClickHouse issue #62716). This file is in config.d, which is the working path.
+
          NOTE when editing: XML comments must not contain two consecutive hyphens. -->
 
-    <!-- 1. metric_log: force Compact parts BEFORE attaching a TTL.
+    <!-- 1. Drop the two profiling tables. Both were pure overhead here: nothing on this
+         host profiles ClickHouse queries, and both are recoverable - restore the table by
+         deleting the corresponding line and restarting. The only permanent loss is history
+         for the period they were off, which does not matter for profiling: when you need a
+         profile you take it now, not last week.
 
-         This table has 1552 columns. TTLDropMerge and TTLDeleteMerge are ALWAYS forced
-         to the Horizontal algorithm (the `vertical_merge_optimize_ttl_delete` setting
-         that would allow otherwise does not exist in 26.3), and a Horizontal merge over
-         Wide parts must open one write buffer per column - roughly 3.6 GiB per merge.
-         Attaching a TTL without these two settings recreates exactly the merge deadlock
-         that filled 259 GB of disk on the SigNoz stack.
+         processors_profile_log was the largest table on disk at 644 MiB (24 rows/s of
+         heavy rows). It records per-pipeline-stage timings, useful only alongside
+         EXPLAIN PIPELINE while optimising one specific query.
+
+         trace_log was 406 MiB (81 rows/s). It holds sampling profiler stack traces for
+         flamegraphs. 99.8% of its samples had an empty query_id, meaning they sampled
+         idle background threads rather than anyone's query. Note that setting
+         query_profiler_real_time_period_ns to 0 in users.d does NOT stop that background
+         sampling - measured, the rate stayed at 75 samples/s - which is why the table has
+         to go rather than the setting. -->
+    <processors_profile_log remove="1"/>
+    <trace_log remove="1"/>
+
+    <!-- 2. text_log: keep the table, raise its threshold instead of dropping it.
+         This is the SQL interface to ClickHouse's own log, and it earned its keep - the
+         Opik healthcheck root cause was found with a single GROUP BY over it. Dropping it
+         would not lose the information, which is also in the container's file log, but it
+         would mean grepping 400 MB of text instead of running a query.
+
+         Its own <level> was `trace`, hence 6.9 million rows in 3 days: 3.59M Trace plus
+         3.28M Debug against 262 Information. Raising it to `information` removes 99.99% of
+         the rows while keeping every warning and error queryable. -->
+    <text_log>
+        <level>information</level>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+    </text_log>
+
+    <!-- 3. Collect asynchronous metrics every 30s instead of every 1s.
+         asynchronous_metric_log wrote 412 rows/s - 77% of all rows inserted on this server
+         - because it stores one row per metric rather than one wide row per sample. On disk
+         it is cheap (0.5 bytes/row after compression), but those rows still have to be
+         merged, and merges were rewriting 7,738 rows/s and 16.5 GiB/day for a database
+         holding 1.6 GiB. Widening the collection period cuts that by 30x while keeping the
+         long-term trend, which is all this table is used for. -->
+    <asynchronous_metrics_update_period_s>30</asynchronous_metrics_update_period_s>
+    <asynchronous_metric_log>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+    </asynchronous_metric_log>
+
+    <!-- 4. Server log level: trace to information.
+         Independent of text_log above, this governs the file log inside the container
+         (/var/log/clickhouse-server/, 1.6 GB across 10 rotated files). `information` keeps
+         startup and configuration messages, which are what actually get read after an
+         incident, and drops the per-query Trace and Debug chatter. -->
+    <logger>
+        <level>information</level>
+    </logger>
+
+    <!-- 5. metric_log: force Compact parts BEFORE attaching a TTL.
+         This table has 1552 columns. TTLDropMerge and TTLDeleteMerge are ALWAYS forced to
+         the Horizontal algorithm (the vertical_merge_optimize_ttl_delete setting that would
+         allow otherwise does not exist in 26.3), and a Horizontal merge over Wide parts
+         must open one write buffer per column - roughly 3.6 GiB per merge. Attaching a TTL
+         without these two settings recreates exactly the merge deadlock that filled 259 GB
+         of disk on the SigNoz stack.
 
          Compact parts keep all 1552 columns in a single file, so Horizontal stays cheap:
-         measured 122 MiB instead of 3.58 GiB. The thresholds only need to exceed
-         anything a 14-day TTL can accumulate, i.e. effectively "never Wide".
+         122 MiB measured against 3.58 GiB. The thresholds only need to exceed anything a
+         14-day TTL can accumulate, i.e. they mean "never Wide".
 
-         Trade-off: reading a single column from a Compact part decompresses the shared
-         block, so column-selective queries on metric_log are slower. Nothing queries
-         this table, so that cost is not paid in practice.
+         Trade-off: a Compact part decompresses its shared block to read one column, so
+         column-selective queries on metric_log are slower. Nothing queries it.
 
-         Declared via <engine> because SETTINGS can only be given inside it; the TTL must
-         therefore live in the engine string too. Do not also add a separate <ttl> tag -
-         ClickHouse refuses to start when both are present. -->
+         Declared via <engine> because SETTINGS can only be given inside it, which forces
+         the TTL in here too. Do not also add a separate <ttl> tag - ClickHouse refuses to
+         start when both are present. -->
     <metric_log>
         <engine>ENGINE = MergeTree
                 PARTITION BY toYYYYMM(event_date)
@@ -42,14 +96,13 @@
                          min_rows_for_wide_part = 100000000</engine>
     </metric_log>
 
-    <!-- 2. A 14-day TTL for the remaining system log tables. These are all narrow (33
-         columns at most), so their Horizontal TTL merges are already cheap - measured
-         on this host at 15 to 265 MiB with zero failures. -->
-    <trace_log>               <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </trace_log>
-    <text_log>                <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </text_log>
-    <part_log>                <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </part_log>
-    <query_log>               <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </query_log>
-    <error_log>               <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </error_log>
-    <asynchronous_metric_log> <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </asynchronous_metric_log>
-    <query_metric_log>        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </query_metric_log>
+    <!-- 6. A 14-day TTL for the tables that are kept. These are all narrow (33 columns at
+         most), so their Horizontal TTL merges are already cheap - 15 to 265 MiB measured on
+         this host, zero failures. query_log and part_log are kept deliberately: Altinity
+         recommends against dropping query_log, and part_log is the table used to diagnose
+         the merge failures that started this whole investigation. -->
+    <part_log>          <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </part_log>
+    <query_log>         <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </query_log>
+    <error_log>         <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </error_log>
+    <query_metric_log>  <ttl>event_date + INTERVAL 14 DAY DELETE</ttl> </query_metric_log>
 </clickhouse>
